@@ -20,6 +20,8 @@ from .common import (
     END_OF_LINE,
     HALF_OF_YEAR_IN_SECONDS,
     Connection,
+    NetASCIIDecoder,
+    NetASCIIEncoder,
     StreamIO,
     StreamThrottle,
     ThrottleStreamIO,
@@ -764,6 +766,7 @@ class Server:
             "rmd": self.rmd,
             "rnfr": self.rnfr,
             "rnto": self.rnto,
+            "size": self.size,
             "stor": self.stor,
             "syst": self.syst,
             "type": self.type,
@@ -993,6 +996,7 @@ class Server:
             response=lambda *args: response_queue.put_nowait(args),
             acquired=False,
             restart_offset=0,
+            transfer_type="I",
             _dispatcher=asyncio.current_task(),
         )
         connection.path_io = self.path_io_factory(
@@ -1400,8 +1404,14 @@ class Server:
             async with file_out, stream:
                 if connection.restart_offset:
                     await file_out.seek(connection.restart_offset)
-                async for data in stream.iter_by_block(connection.block_size):
-                    await file_out.write(data)
+                if connection.transfer_type == "A":
+                    decoder = NetASCIIDecoder()
+                    async for data in stream.iter_by_block(connection.block_size):
+                        await file_out.write(decoder.transform(data))
+                    await file_out.write(decoder.flush())
+                else:
+                    async for data in stream.iter_by_block(connection.block_size):
+                        await file_out.write(data)
             connection.response("226", "data transfer done")
             return True
 
@@ -1440,8 +1450,16 @@ class Server:
             async with file_in, stream:
                 if connection.restart_offset:
                     await file_in.seek(connection.restart_offset)
-                async for data in file_in.iter_by_block(connection.block_size):
-                    await stream.write(data)
+                if connection.transfer_type == "A":
+                    encoder = NetASCIIEncoder()
+                    async for data in file_in.iter_by_block(connection.block_size):
+                        await stream.write(encoder.transform(data))
+                    pending = encoder.flush()
+                    if pending:
+                        await stream.write(pending)
+                else:
+                    async for data in file_in.iter_by_block(connection.block_size):
+                        await stream.write(data)
             connection.response("226", "data transfer done")
             return True
 
@@ -1612,13 +1630,33 @@ class Server:
         return await self.stor(connection, rest, "ab")
 
     async def rest(self, connection: Connection, rest: str) -> bool:
-        if rest.isdigit():
+        if connection.transfer_type == "A":
+            connection.restart_offset = 0
+            message = "REST is not available in TYPE A mode"
+            connection.response("502", message)
+        elif rest.isdigit():
             connection.restart_offset = int(rest)
             connection.response("350", f"restarting at {rest}")
         else:
             connection.restart_offset = 0
             message = f"syntax error, can't restart at {rest!r}"
             connection.response("501", message)
+        return True
+
+    @ConnectionConditions(ConnectionConditions.login_required)
+    @PathConditions(
+        PathConditions.path_must_exists,
+        PathConditions.path_must_be_file,
+    )
+    @PathPermissions(PathPermissions.readable)
+    async def size(self, connection: Connection, rest: str | PurePosixPath) -> bool:
+        if connection.transfer_type == "A":
+            message = "SIZE is not available in TYPE A mode"
+            connection.response("502", message)
+            return True
+        real_path, virtual_path = self.get_paths(connection, rest)
+        stats = await connection.path_io.stat(real_path)
+        connection.response("213", str(stats.st_size))
         return True
 
     async def syst(self, connection: Connection, rest: str) -> bool:

@@ -29,8 +29,10 @@ from .common import (
     HALF_OF_YEAR_IN_SECONDS,
     TWO_YEARS_IN_SECONDS,
     AbstractAsyncLister,
-    AsyncEnterableInstanceProtocol,
+    AsyncStreamIterator,
     Code,
+    NetASCIIDecoder,
+    NetASCIIEncoder,
     SSLSessionBoundContext,
     StreamThrottle,
     ThrottleStreamIO,
@@ -57,6 +59,8 @@ __all__ = (
     "Client",
     "DataConnectionThrottleStreamIO",
     "ListInfo",
+    "NetASCIIDecoderStreamIO",
+    "NetASCIIEncoderStreamIO",
     "UnixListInfo",
 )
 logger = logging.getLogger(__name__)
@@ -130,6 +134,121 @@ class DataConnectionThrottleStreamIO(ThrottleStreamIO):
             await self.finish()
         else:
             self.close()
+
+
+class NetASCIIEncoderStreamIO:
+    """
+    Write-side wrapper applying the incremental local-to-NetASCII (TYPE A)
+    transform to everything written, before it reaches the wire. Unknown
+    attributes are proxied to the wrapped stream.
+
+    :param stream: stream to wrap
+    :type stream: :py:class:`aioftp.DataConnectionThrottleStreamIO`
+    """
+
+    def __init__(self, stream: DataConnectionThrottleStreamIO) -> None:
+        self.stream = stream
+        self.transformer = NetASCIIEncoder()
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self.stream, name)
+
+    async def __aenter__(self) -> Self:
+        return self
+
+    async def __aexit__(self, *args: Any) -> None:
+        if args[0] is None:
+            pending = self.transformer.flush()
+            if pending:
+                await self.stream.write(pending)
+        await self.stream.__aexit__(*args)
+
+    async def write(self, data: bytes) -> None:
+        """
+        Transform local bytes to NetASCII and write them to the stream.
+
+        :param data: local bytes
+        :type data: :py:class:`bytes`
+        """
+        await self.stream.write(self.transformer.transform(data))
+
+    async def finish(
+        self,
+        expected_codes: str | tuple[str, ...] = "2xx",
+        wait_codes: str | tuple[str, ...] = "1xx",
+    ) -> None:
+        """
+        Flush pending transformed bytes (if any), close the connection and
+        wait for the final server response.
+
+        :param expected_codes: tuple of expected codes or expected code
+        :type expected_codes: :py:class:`tuple` of :py:class:`str` or
+            :py:class:`str`
+
+        :param wait_codes: tuple of wait codes or wait code
+        :type wait_codes: :py:class:`tuple` of :py:class:`str` or
+            :py:class:`str`
+        """
+        pending = self.transformer.flush()
+        if pending:
+            await self.stream.write(pending)
+        await self.stream.finish(expected_codes, wait_codes)
+
+
+class NetASCIIDecoderStreamIO:
+    """
+    Read-side wrapper applying the incremental NetASCII-to-local (TYPE A)
+    transform to everything read from the wire. Unknown attributes are
+    proxied to the wrapped stream.
+
+    :param stream: stream to wrap
+    :type stream: :py:class:`aioftp.DataConnectionThrottleStreamIO`
+    """
+
+    def __init__(self, stream: DataConnectionThrottleStreamIO) -> None:
+        self.stream = stream
+        self.transformer = NetASCIIDecoder()
+        self._flushed = False
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self.stream, name)
+
+    async def __aenter__(self) -> Self:
+        return self
+
+    async def __aexit__(self, *args: Any) -> None:
+        await self.stream.__aexit__(*args)
+
+    async def read(self, count: int = -1) -> bytes:
+        """
+        Read NetASCII bytes from the stream and return them transformed to
+        the local representation. A trailing lone ``\\r`` is resolved
+        to a literal ``\\r`` at end of stream.
+
+        :param count: block size for read operation
+        :type count: :py:class:`int`
+
+        :rtype: :py:class:`bytes`
+        """
+        while True:
+            data = await self.stream.read(count)
+            if not data:
+                if self._flushed:
+                    return b""
+                self._flushed = True
+                return self.transformer.flush()
+            out = self.transformer.transform(data)
+            if out:
+                return out
+
+    def iter_by_block(self, count: int = DEFAULT_BLOCK_SIZE) -> AsyncStreamIterator:
+        """
+        Read/iterate stream by block, transforming NetASCII to the local
+        representation.
+
+        :rtype: :py:class:`aioftp.AsyncStreamIterator`
+        """
+        return AsyncStreamIterator(lambda: self.read(count))
 
 
 UnixListInfo = TypedDict(
@@ -1124,51 +1243,79 @@ class Client(BaseClient):
                         await self.remove(name)
                 await self.remove_directory(path)
 
-    def upload_stream(
+    @async_enterable
+    async def upload_stream(
         self,
         destination: PathLike,
         *,
         offset: int = 0,
-    ) -> AsyncEnterableInstanceProtocol[DataConnectionThrottleStreamIO]:
+        conn_type: ConnType = "I",
+    ) -> DataConnectionThrottleStreamIO | NetASCIIEncoderStreamIO:
         """
         Create stream for write data to `destination` file.
 
         :param destination: destination path of file on server side
         :type destination: :py:class:`str` or :py:class:`pathlib.PurePosixPath`
 
-        :param offset: byte offset for stream start position
+        :param offset: byte offset for stream start position (not available
+            for ``conn_type="A"``, since local byte offsets do not
+            match transformed network byte offsets)
         :type offset: :py:class:`int`
 
-        :rtype: :py:class:`aioftp.DataConnectionThrottleStreamIO`
+        :param conn_type: connection type ("I", "A"). For "A" written data
+            is incrementally transformed from local representation to
+            NetASCII
+        :type conn_type: :py:class:`str`
+
+        :rtype: :py:class:`aioftp.DataConnectionThrottleStreamIO` or
+            :py:class:`aioftp.NetASCIIEncoderStreamIO`
         """
-        return self.get_stream(
+        stream = await self.get_stream(
             "STOR " + str(destination),
             "1xx",
             offset=offset,
+            conn_type=conn_type,
         )
+        if conn_type == "A":
+            return NetASCIIEncoderStreamIO(stream)
+        return stream
 
-    def append_stream(
+    @async_enterable
+    async def append_stream(
         self,
         destination: PathLike,
         *,
         offset: int = 0,
-    ) -> AsyncEnterableInstanceProtocol[DataConnectionThrottleStreamIO]:
+        conn_type: ConnType = "I",
+    ) -> DataConnectionThrottleStreamIO | NetASCIIEncoderStreamIO:
         """
         Create stream for append (write) data to `destination` file.
 
         :param destination: destination path of file on server side
         :type destination: :py:class:`str` or :py:class:`pathlib.PurePosixPath`
 
-        :param offset: byte offset for stream start position
+        :param offset: byte offset for stream start position (not available
+            for ``conn_type="A"``, since local byte offsets do not
+            match transformed network byte offsets)
         :type offset: :py:class:`int`
 
-        :rtype: :py:class:`aioftp.DataConnectionThrottleStreamIO`
+        :param conn_type: connection type ("I", "A"). For "A" written data
+            is incrementally transformed from local representation to
+            NetASCII
+        :type conn_type: :py:class:`str`
+
+        :rtype: :py:class:`aioftp.DataConnectionThrottleStreamIO` or
+            :py:class:`aioftp.NetASCIIEncoderStreamIO`
         """
-        return self.get_stream(
+        stream = await self.get_stream(
             "APPE " + str(destination),
             "1xx",
             offset=offset,
+            conn_type=conn_type,
         )
+        if conn_type == "A":
+            return NetASCIIEncoderStreamIO(stream)
+        return stream
 
     async def upload(
         self,
@@ -1177,6 +1324,7 @@ class Client(BaseClient):
         *,
         write_into: bool = False,
         block_size: int = DEFAULT_BLOCK_SIZE,
+        conn_type: ConnType = "I",
     ) -> None:
         """
         :py:func:`asyncio.coroutine`
@@ -1197,6 +1345,10 @@ class Client(BaseClient):
 
         :param block_size: block size for transaction
         :type block_size: :py:class:`int`
+
+        :param conn_type: connection type ("I", "A"). For "A" data is
+            incrementally transformed from local representation to NetASCII
+        :type conn_type: :py:class:`str`
         """
         source = Path(source)
         destination = PurePosixPath(destination)
@@ -1204,7 +1356,10 @@ class Client(BaseClient):
             destination = destination / source.name
         if await self.path_io.is_file(source):
             await self.make_directory(destination.parent)
-            async with self.path_io.open(source, mode="rb") as file_in, self.upload_stream(destination) as stream:
+            async with (
+                self.path_io.open(source, mode="rb") as file_in,
+                self.upload_stream(destination, conn_type=conn_type) as stream,
+            ):
                 async for block in file_in.iter_by_block(block_size):
                     await stream.write(block)
         elif await self.path_io.is_dir(source):
@@ -1228,14 +1383,17 @@ class Client(BaseClient):
                             relative,
                             write_into=True,
                             block_size=block_size,
+                            conn_type=conn_type,
                         )
 
-    def download_stream(
+    @async_enterable
+    async def download_stream(
         self,
         source: PathLike,
         *,
         offset: int = 0,
-    ) -> AsyncEnterableInstanceProtocol[DataConnectionThrottleStreamIO]:
+        conn_type: ConnType = "I",
+    ) -> DataConnectionThrottleStreamIO | NetASCIIDecoderStreamIO:
         """
         :py:func:`asyncio.coroutine`
 
@@ -1244,12 +1402,28 @@ class Client(BaseClient):
         :param source: source path of file on server side
         :type source: :py:class:`str` or :py:class:`pathlib.PurePosixPath`
 
-        :param offset: byte offset for stream start position
+        :param offset: byte offset for stream start position (not available
+            for ``conn_type="A"``, since local byte offsets do not
+            match transformed network byte offsets)
         :type offset: :py:class:`int`
 
-        :rtype: :py:class:`aioftp.DataConnectionThrottleStreamIO`
+        :param conn_type: connection type ("I", "A"). For "A" received data
+            is incrementally transformed from NetASCII to local
+            representation
+        :type conn_type: :py:class:`str`
+
+        :rtype: :py:class:`aioftp.DataConnectionThrottleStreamIO` or
+            :py:class:`aioftp.NetASCIIDecoderStreamIO`
         """
-        return self.get_stream("RETR " + str(source), "1xx", offset=offset)
+        stream = await self.get_stream(
+            "RETR " + str(source),
+            "1xx",
+            offset=offset,
+            conn_type=conn_type,
+        )
+        if conn_type == "A":
+            return NetASCIIDecoderStreamIO(stream)
+        return stream
 
     async def download(
         self,
@@ -1258,6 +1432,7 @@ class Client(BaseClient):
         *,
         write_into: bool = False,
         block_size: int = DEFAULT_BLOCK_SIZE,
+        conn_type: ConnType = "I",
     ) -> None:
         """
         :py:func:`asyncio.coroutine`
@@ -1278,6 +1453,10 @@ class Client(BaseClient):
 
         :param block_size: block size for transaction
         :type block_size: :py:class:`int`
+
+        :param conn_type: connection type ("I", "A"). For "A" data is
+            incrementally transformed from NetASCII to local representation
+        :type conn_type: :py:class:`str`
         """
         source = PurePosixPath(source)
         destination_path = Path(destination)
@@ -1291,7 +1470,7 @@ class Client(BaseClient):
             )
             async with (
                 self.path_io.open(destination_path, mode="wb") as file_out,
-                self.download_stream(source) as stream,
+                self.download_stream(source, conn_type=conn_type) as stream,
             ):
                 async for block in stream.iter_by_block(block_size):
                     await file_out.write(block)
@@ -1305,6 +1484,7 @@ class Client(BaseClient):
                         full,
                         write_into=True,
                         block_size=block_size,
+                        conn_type=conn_type,
                     )
 
     async def quit(self) -> None:
@@ -1397,13 +1577,21 @@ class Client(BaseClient):
         :param conn_type: connection type ("I", "A", "E", "L")
         :type conn_type: :py:class:`str`
 
-        :param offset: byte offset for stream start position
+        :param offset: byte offset for stream start position (not available
+            for ``conn_type="A"``, since local byte offsets do not
+            match transformed network byte offsets)
         :type offset: :py:class:`int`
 
         :rtype: :py:class:`aioftp.DataConnectionThrottleStreamIO`
         """
         reader, writer = await self.get_passive_connection(conn_type)
         if offset:
+            if conn_type == "A":
+                raise ValueError(
+                    "offset (REST) is not available for TYPE A transfers, "
+                    "because local byte offsets do not match transformed "
+                    "network byte offsets",
+                )
             await self.command("REST " + str(offset), "350")
         await self.command(command, expected_codes, wait_codes, censor_after)
         stream = DataConnectionThrottleStreamIO(

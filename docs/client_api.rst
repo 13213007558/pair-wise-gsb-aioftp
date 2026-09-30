@@ -13,6 +13,12 @@ Client API
     :members:
     :show-inheritance:
 
+.. autoclass:: aioftp.NetASCIIEncoderStreamIO
+    :members:
+
+.. autoclass:: aioftp.NetASCIIDecoderStreamIO
+    :members:
+
 .. autoclass:: aioftp.Code
     :members:
     :show-inheritance:

@@ -319,6 +319,31 @@ The idea is to seek position of source «file» for upload and start
 upload + offset/append. Opposite situation for download («file» append and
 download + offset)
 
+NOTE
+^^^^
+
+`offset` (REST) is only available for binary (TYPE I) transfers. In
+TYPE A (text) mode data is transformed to/from NetASCII on the fly, so local
+file byte offsets do not match the transformed network byte offsets and can
+not be used for restarting. For the same reason the server refuses REST and
+SIZE commands in TYPE A mode.
+
+Text mode (TYPE A)
+^^^^^^^^^^^^^^^^^^
+
+Passing `conn_type="A"` to `upload_stream`, `append_stream`,
+`download_stream`, `upload` or `download` enables NetASCII
+transformation (RFC 959): data is converted incrementally (the whole file is
+never cached in memory), `\r\n` on the wire means newline, `\r\x00` means
+a literal carriage return and a trailing lone `\r` is treated as a literal
+carriage return. TYPE I (the default) transfers bytes unchanged.
+
+::
+
+    >>> async with client.download_stream("tmp.py", conn_type="A") as stream:
+    ...     async for block in stream.iter_by_block():
+    ...         # do something with data
+
 Throttle
 --------
 

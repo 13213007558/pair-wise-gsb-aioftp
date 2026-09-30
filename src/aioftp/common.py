@@ -23,6 +23,8 @@ __all__ = (
     "Throttle",
     "StreamThrottle",
     "ThrottleStreamIO",
+    "NetASCIIEncoder",
+    "NetASCIIDecoder",
     "END_OF_LINE",
     "DEFAULT_BLOCK_SIZE",
     "wrap_with_container",
@@ -161,6 +163,101 @@ class AsyncStreamIterator:
             return data
         else:
             raise StopAsyncIteration
+
+
+class NetASCIIEncoder:
+    r"""
+    Incremental local-to-NetASCII (TYPE A) transform.
+
+    Converts a local byte stream to the network representation on the fly,
+    holding no more than one byte of state, so files of any size are
+    transformed without being cached in memory:
+
+    * ``\n`` (local newline) -> ``\r\n``
+    * ``\r`` (literal carriage return) -> ``\r\x00``
+
+    The transform is byte-local and therefore stateless; :py:meth:`flush`
+    is provided for symmetry with :py:class:`NetASCIIDecoder` and always
+    returns an empty bytes object.
+    """
+
+    def transform(self, data: bytes) -> bytes:
+        """
+        Convert a chunk of local bytes to NetASCII.
+
+        :param data: local bytes
+        :type data: :py:class:`bytes`
+
+        :rtype: :py:class:`bytes`
+        """
+        return data.replace(b"\r", b"\r\x00").replace(b"\n", b"\r\n")
+
+    def flush(self) -> bytes:
+        """
+        Return any buffered trailing bytes. Always empty for the encoder.
+
+        :rtype: :py:class:`bytes`
+        """
+        return b""
+
+
+class NetASCIIDecoder:
+    r"""
+    Incremental NetASCII-to-local (TYPE A) transform.
+
+    Converts a network byte stream to the local representation on the fly,
+    holding no more than one byte of state, so files of any size are
+    transformed without being cached in memory:
+
+    * ``\r\n`` -> ``\n`` (newline)
+    * ``\r\x00`` -> ``\r`` (literal carriage return)
+    * ``\r`` followed by any other byte -> literal ``\r`` followed by
+      that byte
+    * a trailing lone ``\r`` at the end of the stream is emitted as a
+      literal ``\r`` by :py:meth:`flush`
+    """
+
+    def __init__(self) -> None:
+        self._pending_cr = False
+
+    def transform(self, data: bytes) -> bytes:
+        """
+        Convert a chunk of NetASCII bytes to local representation.
+
+        :param data: NetASCII bytes
+        :type data: :py:class:`bytes`
+
+        :rtype: :py:class:`bytes`
+        """
+        out = bytearray()
+        for byte in data:
+            if self._pending_cr:
+                self._pending_cr = False
+                if byte == 0x0A:  # \n
+                    out.append(0x0A)
+                    continue
+                elif byte == 0x00:
+                    out.append(0x0D)  # \r
+                    continue
+                else:
+                    out.append(0x0D)  # lone \r stays literal
+            if byte == 0x0D:  # \r
+                self._pending_cr = True
+            else:
+                out.append(byte)
+        return bytes(out)
+
+    def flush(self) -> bytes:
+        r"""
+        Resolve a trailing lone ``\r`` (if any) to a literal ``\r``.
+        Must be called once the stream is exhausted.
+
+        :rtype: :py:class:`bytes`
+        """
+        if self._pending_cr:
+            self._pending_cr = False
+            return b"\r"
+        return b""
 
 
 IterableType = TypeVar("IterableType")

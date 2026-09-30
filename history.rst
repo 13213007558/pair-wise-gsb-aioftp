@@ -1,3 +1,11 @@
+0.28.4 (unreleased)
+-------------------
+- add TYPE A (NetASCII) incremental transformation for upload and download on both client and server: CRLF is a newline, CRNUL is a literal CR and a trailing lone CR is a literal CR; transformation is streaming, files are never cached in memory as a whole; TYPE I transfers stay unchanged
+- add `conn_type` argument to client `upload_stream`, `append_stream`, `download_stream`, `upload` and `download`
+- add `NetASCIIEncoder`, `NetASCIIDecoder`, `NetASCIIEncoderStreamIO` and `NetASCIIDecoderStreamIO` to public api
+- server: add `SIZE` command (available in TYPE I mode only)
+- server: refuse `REST` and `SIZE` in TYPE A mode; client raises `ValueError` for `offset` with `conn_type="A"`, since local byte offsets do not match transformed network byte offsets
+
 0.28.3 (2026-09-19)
 -------------------
 - client `is_dir` should treat `cdir` and `pdir` as a directory too, according to RFC3659 (fixes #211)

@@ -16,6 +16,12 @@ Common API
     :members:
     :show-inheritance:
 
+.. autoclass:: aioftp.NetASCIIEncoder
+    :members:
+
+.. autoclass:: aioftp.NetASCIIDecoder
+    :members:
+
 .. autoclass:: aioftp.AsyncListerMixin
 
 .. autoclass:: aioftp.AbstractAsyncLister
